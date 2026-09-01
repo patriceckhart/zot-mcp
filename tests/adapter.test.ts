@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import assert from "node:assert/strict";
 import { join } from "node:path";
+import { afterEach, describe, test } from "node:test";
 import { McpAdapter, normalizeToolPath } from "../src/adapter.ts";
 
 const adapters: McpAdapter[] = [];
@@ -8,11 +9,11 @@ afterEach(async () => {
 });
 
 function fixtureAdapter(): McpAdapter {
-  const root = join(import.meta.dir, "..");
+  const root = join(import.meta.dirname, "..");
   const adapter = new McpAdapter({
     fixture: {
       command: process.execPath,
-      args: [join(import.meta.dir, "fixture-server.ts")],
+      args: [join(import.meta.dirname, "fixture-server.ts")],
     },
     disabled: {
       command: "never-started",
@@ -25,7 +26,7 @@ function fixtureAdapter(): McpAdapter {
 
 describe("McpAdapter", () => {
   test("reports status without starting lazy servers", async () => {
-    expect(await fixtureAdapter().status()).toEqual({
+    assert.deepEqual(await fixtureAdapter().status(), {
       servers: [
         { name: "fixture", status: "not-connected", toolCount: 0 },
         { name: "disabled", status: "disabled", toolCount: 0 },
@@ -35,25 +36,27 @@ describe("McpAdapter", () => {
 
   test("searches, describes, and calls stdio tools", async () => {
     const adapter = fixtureAdapter();
-    expect(await adapter.search("echo text")).toEqual({
+    assert.deepEqual(await adapter.search("echo text"), {
       query: "echo text",
       tools: [{ server: "fixture", path: "fixture__echo", name: "echo", description: "Echo a text value" }],
     });
-    expect(await adapter.describe("fixture__echo")).toMatchObject({
+    assert.deepEqual(await adapter.describe("fixture__echo"), {
       server: "fixture",
+      path: "fixture__echo",
       name: "echo",
-      inputSchema: { required: ["text"] },
+      description: "Echo a text value",
+      inputSchema: { type: "object", properties: { text: { type: "string" } }, required: ["text"] },
     });
-    expect(await adapter.call("fixture__echo", { text: "hello" })).toEqual({
+    assert.deepEqual(await adapter.call("fixture__echo", { text: "hello" }), {
       content: [{ type: "text", text: "hello" }],
     });
   });
 
   test("validates proxy actions", async () => {
-    await expect(fixtureAdapter().execute({ action: "call" })).rejects.toThrow("tool is required");
+    await assert.rejects(fixtureAdapter().execute({ action: "call" }), /tool is required/);
   });
 });
 
 test("normalizes server-qualified tool paths", () => {
-  expect(normalizeToolPath("my server", "read.file")).toBe("my_server__read_file");
+  assert.equal(normalizeToolPath("my server", "read.file"), "my_server__read_file");
 });

@@ -1,5 +1,8 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 
 export type JsonObject = Record<string, unknown>;
 
@@ -79,11 +82,16 @@ export async function loadConfig(projectCwd: string): Promise<Record<string, Ser
   const merged: Record<string, ServerConfig> = {};
 
   for (const path of [globalPath, projectPath]) {
-    const file = Bun.file(path);
-    if (!(await file.exists())) continue;
+    let contents: string;
+    try {
+      contents = await readFile(path, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+      throw new Error(`cannot read ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    }
     let parsed: McpConfig;
     try {
-      parsed = (await file.json()) as McpConfig;
+      parsed = JSON.parse(contents) as McpConfig;
     } catch (error) {
       throw new Error(`cannot parse ${path}: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -97,17 +105,20 @@ export async function loadConfig(projectCwd: string): Promise<Record<string, Ser
 }
 
 export class StdioTransport implements Transport {
-  private process?: ReturnType<typeof Bun.spawn>;
+  private process?: ChildProcessWithoutNullStreams;
   private nextID = 1;
   private pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
-  private readerTask?: Promise<void>;
+  private readonly name: string;
+  private readonly config: ServerConfig;
+  private readonly projectCwd: string;
+  private readonly log: (message: string) => void;
 
-  constructor(
-    private readonly name: string,
-    private readonly config: ServerConfig,
-    private readonly projectCwd: string,
-    private readonly log: (message: string) => void,
-  ) {}
+  constructor(name: string, config: ServerConfig, projectCwd: string, log: (message: string) => void) {
+    this.name = name;
+    this.config = config;
+    this.projectCwd = projectCwd;
+    this.log = log;
+  }
 
   async start(): Promise<void> {
     if (!this.config.command) throw new Error(`${this.name}: command is required`);
@@ -115,45 +126,29 @@ export class StdioTransport implements Transport {
     const env = { ...process.env } as Record<string, string>;
     for (const [key, value] of Object.entries(this.config.env ?? {})) env[key] = interpolate(value);
 
-    this.process = Bun.spawn([interpolate(this.config.command), ...(this.config.args ?? []).map((arg) => interpolate(arg))], {
+    this.process = spawn(interpolate(this.config.command), (this.config.args ?? []).map((arg) => interpolate(arg)), {
       cwd,
       env,
-      stdin: "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
+      stdio: ["pipe", "pipe", "pipe"],
     });
-    this.readerTask = this.readStdout(this.process.stdout);
-    void this.readStderr(this.process.stderr);
-    void this.process.exited.then((code) => {
-      const error = new Error(`${this.name}: server exited with code ${code}`);
-      for (const pending of this.pending.values()) pending.reject(error);
-      this.pending.clear();
+    const stdout = createInterface({ input: this.process.stdout, crlfDelay: Infinity });
+    stdout.on("line", (line) => {
+      if (line.trim()) this.handleLine(line);
+    });
+    const stderr = createInterface({ input: this.process.stderr, crlfDelay: Infinity });
+    stderr.on("line", (line) => {
+      if (line.trim()) this.log(`${this.name}: ${line}`);
+    });
+    this.process.on("error", (error) => this.rejectPending(new Error(`${this.name}: ${error.message}`)));
+    this.process.on("exit", (code, signal) => {
+      const detail = signal ? `signal ${signal}` : `code ${code ?? "unknown"}`;
+      this.rejectPending(new Error(`${this.name}: server exited with ${detail}`));
     });
   }
 
-  private async readStdout(stream: ReadableStream<Uint8Array>): Promise<void> {
-    const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
-    let buffer = "";
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        buffer += value;
-        let newline: number;
-        while ((newline = buffer.indexOf("\n")) >= 0) {
-          const line = buffer.slice(0, newline).trim();
-          buffer = buffer.slice(newline + 1);
-          if (line) this.handleLine(line);
-        }
-      }
-    } catch (error) {
-      this.log(`${this.name}: stdout read failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  private async readStderr(stream: ReadableStream<Uint8Array>): Promise<void> {
-    const text = await new Response(stream).text();
-    for (const line of text.split("\n")) if (line.trim()) this.log(`${this.name}: ${line}`);
+  private rejectPending(error: Error): void {
+    for (const pending of this.pending.values()) pending.reject(error);
+    this.pending.clear();
   }
 
   private handleLine(line: string): void {
@@ -195,25 +190,38 @@ export class StdioTransport implements Transport {
   private write(message: JsonObject): void {
     if (!this.process) throw new Error(`${this.name}: server is not running`);
     this.process.stdin.write(`${JSON.stringify(message)}\n`);
-    this.process.stdin.flush();
   }
 
   async close(): Promise<void> {
-    if (!this.process) return;
-    this.process.stdin.end();
-    const exited = this.process.exited;
-    setTimeout(() => this.process?.kill(), 500).unref();
-    await exited.catch(() => undefined);
-    await this.readerTask?.catch(() => undefined);
+    const process = this.process;
+    if (!process) return;
     this.process = undefined;
+    process.stdin.end();
+    await new Promise<void>((resolve) => {
+      if (process.exitCode !== null || process.signalCode !== null) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(() => process.kill(), 500);
+      timer.unref();
+      process.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 }
 
 export class HttpTransport implements Transport {
   private nextID = 1;
   private sessionID?: string;
+  private readonly name: string;
+  private readonly config: ServerConfig;
 
-  constructor(private readonly name: string, private readonly config: ServerConfig) {}
+  constructor(name: string, config: ServerConfig) {
+    this.name = name;
+    this.config = config;
+  }
 
   async request(method: string, params?: unknown): Promise<unknown> {
     return this.send({ jsonrpc: "2.0", id: this.nextID++, method, ...(params === undefined ? {} : { params }) }, true);
@@ -275,12 +283,12 @@ interface ServerState {
 
 export class McpAdapter {
   private readonly servers = new Map<string, ServerState>();
+  private readonly projectCwd: string;
+  private readonly log: (message: string) => void;
 
-  constructor(
-    configs: Record<string, ServerConfig>,
-    private readonly projectCwd: string,
-    private readonly log: (message: string) => void = () => {},
-  ) {
+  constructor(configs: Record<string, ServerConfig>, projectCwd: string, log: (message: string) => void = () => {}) {
+    this.projectCwd = projectCwd;
+    this.log = log;
     for (const [name, config] of Object.entries(configs)) this.servers.set(name, { config });
   }
 

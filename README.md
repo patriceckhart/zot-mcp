@@ -1,11 +1,12 @@
 # zot-mcp
 
-A dependency-free TypeScript zot extension that exposes configured MCP servers through one proxy tool. It is executed directly by Bun, so there is no build step and no local `node_modules` directory.
+A dependency-free TypeScript zot extension that exposes configured MCP servers through one proxy tool. It is executed directly by Node.js, so there is no build step and no local `node_modules` directory.
 
 ## Requirements
 
 - zot 0.3.54 or newer
-- Bun 1.3 or newer on `PATH`
+- Node.js 22.18 or newer on `PATH`
+- npm
 
 ## Install
 
@@ -74,5 +75,5 @@ This initial version supports MCP tools over stdio and Streamable HTTP. It does 
 ## Test
 
 ```sh
-bun test
+npm test
 ```
