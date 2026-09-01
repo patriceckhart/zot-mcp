@@ -1,0 +1,8 @@
+{
+  "name": "zot-mcp",
+  "version": "1.0.0",
+  "exec": "./zot-mcp.ts",
+  "language": "typescript",
+  "description": "Use MCP servers through one context-efficient proxy tool",
+  "enabled": true
+}
